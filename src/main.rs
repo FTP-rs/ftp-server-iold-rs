@@ -1,5 +1,7 @@
+#![feature(generators, generator_trait)]
+
 #[macro_use]
-extern crate may;
+extern crate iold;
 extern crate serde;
 #[macro_use]
 extern crate serde_derive;
@@ -15,11 +17,12 @@ use std::ffi::OsString;
 use std::fs::{File, Metadata, create_dir, read_dir, remove_dir_all};
 use std::io::{self, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::ops::Generator;
 use std::path::{Component, Path, PathBuf, StripPrefixError};
 use std::result;
 use std::str;
 
-use may::net::{TcpListener, TcpStream};
+use iold::{EventLoop, TcpListener, TcpStream};
 
 use cmd::{Command, TransferType};
 use config::Config;
@@ -110,54 +113,62 @@ impl Client {
         self.name.is_some() && self.waiting_password == false
     }
 
-    fn handle_cmd(&mut self, cmd: Command) -> io::Result<()> {
-        println!("====> {:?}", cmd);
-        match cmd {
-            Command::Auth => self.send(ResultCode::CommandNotImplemented, "Not implemented"),
-            Command::CdUp if self.is_logged() => {
-                if let Some(path) = self.cwd.parent().map(Path::to_path_buf) {
-                    self.cwd = path;
-                    prefix_slash(&mut self.cwd);
+    fn handle_cmd<'a>(&'a mut self, cmd: Command) ->
+        impl Generator<Yield = iold::YieldValue, Return = io::Result<()>> + 'a
+    {
+        static move || {
+            println!("====> {:?}", cmd);
+            match cmd {
+                Command::Auth => await!(self.send(ResultCode::CommandNotImplemented, "Not implemented")),
+                Command::CdUp if self.is_logged() => {
+                    if let Some(path) = self.cwd.parent().map(Path::to_path_buf) {
+                        self.cwd = path;
+                        prefix_slash(&mut self.cwd);
+                    }
+                    await!(self.send(ResultCode::Ok, "Done"))
                 }
-                self.send(ResultCode::Ok, "Done")
-            }
-            Command::Cwd(ref directory) if self.is_logged() => self.cwd(directory),
-            Command::List(ref path) if self.is_logged() => self.list(path),
-            Command::Mkd(ref path) if self.is_logged() => self.mkd(path),
-            Command::NoOp => self.send(ResultCode::Ok, "Doing nothing"),
-            Command::Pass(ref content) if self.name.is_some() && self.waiting_password => {
-                self.pass(content)
-            }
-            Command::Pasv if self.is_logged() => self.pasv(),
-            Command::Port(port) if self.is_logged() => {
-                self.data_port = Some(port);
-                self.send(ResultCode::Ok, &format!("Data port is now {}", port))
-            }
-            Command::Pwd if self.is_logged() => {
-                let msg = format!("{}", self.cwd.to_str().unwrap_or("")); // small trick
-                if !msg.is_empty() {
-                    let message = format!("\"{}\" ", msg);
-                    self.send(ResultCode::PATHNAMECreated, &message)
-                } else {
-                    self.send(ResultCode::FileNotFound, "No such file or directory")
+                Command::Cwd(ref directory) if self.is_logged() => await!(self.cwd(directory)),
+                Command::List(ref path) if self.is_logged() => await!(self.list(path)),
+                Command::Mkd(ref path) if self.is_logged() => await!(self.mkd(path)),
+                Command::NoOp => await!(self.send(ResultCode::Ok, "Doing nothing")),
+                Command::Pass(ref content) if self.name.is_some() && self.waiting_password => {
+                    await!(self.pass(content))
                 }
+                Command::Pasv if self.is_logged() => await!(self.pasv()),
+                Command::Port(port) if self.is_logged() => {
+                    self.data_port = Some(port);
+                    let answer = format!("Data port is now {}", port);
+                    await!(self.send(ResultCode::Ok, &answer))
+                }
+                Command::Pwd if self.is_logged() => {
+                    let msg = format!("{}", self.cwd.to_str().unwrap_or("")); // small trick
+                    if !msg.is_empty() {
+                        let message = format!("\"{}\" ", msg);
+                        await!(self.send(ResultCode::PATHNAMECreated, &message))
+                    } else {
+                        await!(self.send(ResultCode::FileNotFound, "No such file or directory"))
+                    }
+                }
+                Command::Quit => await!(self.quit()),
+                Command::Retr(ref file) if self.is_logged() => await!(self.retr(file)),
+                Command::Rmd(ref path) if self.is_logged() => await!(self.rmd(path)),
+                Command::Stor(ref file) if self.is_logged() => await!(self.stor(file)),
+                Command::Syst => await!(self.send(ResultCode::Ok, "I won't tell")),
+                Command::Type(typ) => {
+                    self.transfer_type = typ;
+                    await!(self.send(ResultCode::Ok, "Transfer type changed successfully"))
+                }
+                Command::Unknown(s) => {
+                    let answer = format!("Not implemented: '{:?}'", s);
+                    await!(self.send(ResultCode::UnknownCommand, &answer))
+                },
+                Command::User(ref content) => await!(self.user(content)),
+                _ => await!(self.send(ResultCode::NotLoggedIn, "Please log first")),
             }
-            Command::Quit => self.quit(),
-            Command::Retr(ref file) if self.is_logged() => self.retr(file),
-            Command::Rmd(ref path) if self.is_logged() => self.rmd(path),
-            Command::Stor(ref file) if self.is_logged() => self.stor(file),
-            Command::Syst => self.send(ResultCode::Ok, "I won't tell"),
-            Command::Type(typ) => {
-                self.transfer_type = typ;
-                self.send(ResultCode::Ok, "Transfer type changed successfully")
-            }
-            Command::Unknown(s) => self.send(ResultCode::UnknownCommand,
-                                             &format!("Not implemented: '{:?}'", s)),
-            Command::User(ref content) => self.user(content),
-            _ => self.send(ResultCode::NotLoggedIn, "Please log first"),
         }
     }
 
+    async! {
     fn pass(&mut self, content: &str) -> io::Result<()> {
         let mut ok = false;
         if self.is_admin {
@@ -175,15 +186,18 @@ impl Client {
         if ok {
             self.waiting_password = false;
             let name = self.name.clone().unwrap_or(String::new());
-            self.send(ResultCode::UserLoggedIn, &format!("Welcome {}", name))
+            let answer = format!("Welcome {}", name);
+            await!(self.send(ResultCode::UserLoggedIn, &answer))
         } else {
-            self.send(ResultCode::NotLoggedIn, "Invalid password")
+            await!(self.send(ResultCode::NotLoggedIn, "Invalid password"))
         }
     }
+    }
 
+    async! {
     fn user(&mut self, content: &str) -> io::Result<()> {
         if content.is_empty() {
-            self.send(ResultCode::InvalidParameterOrArgument, "Invalid username")
+            await!(self.send(ResultCode::InvalidParameterOrArgument, "Invalid username"))
         } else {
             let mut name = None;
             let mut pass_required = true;
@@ -206,69 +220,76 @@ impl Client {
                 }
             }
             if name.is_none() {
-                self.send(ResultCode::NotLoggedIn, "Unknown user...")
+                await!(self.send(ResultCode::NotLoggedIn, "Unknown user..."))
             } else {
                 self.name = name.clone();
                 if pass_required {
                     self.waiting_password = true;
-                    self.send(ResultCode::UserNameOkayNeedPassword,
-                              &format!("Login OK, password needed for {}", content))
+                    let answer = format!("Login OK, password needed for {}", content);
+                    await!(self.send(ResultCode::UserNameOkayNeedPassword, &answer))
                 } else {
                     self.waiting_password = false;
-                    self.send(ResultCode::UserLoggedIn, &format!("Welcome {}!", content))
+                    let answer = format!("Welcome {}!", content);
+                    await!(self.send(ResultCode::UserLoggedIn, &answer))
                 }
             }
         }
     }
+    }
 
-    fn list(&mut self, path: &Option<PathBuf>) -> io::Result<()> {
-        if self.data_stream.is_some() {
-            let x = Default::default();
-            let path = match *path {
-                Some(ref p) => p,
-                None => &x,
-            };
-            let directory = PathBuf::from(&path);
-            let res = self.complete_path(directory);
-            if let Ok(path) = res {
-                self.send(ResultCode::DataConnectionAlreadyOpen, "Starting to list directory...")?;
-                let mut out = vec![];
-                if path.is_dir() {
-                    if let Ok(dir) = read_dir(path) {
-                        for entry in dir {
-                            if let Ok(entry) = entry {
-                                if self.is_admin ||
-                                   entry.path() != self.server_root.join(CONFIG_FILE) {
-                                    add_file_info(entry.path(), &mut out);
+    fn list<'a>(&'a mut self, path: &'a Option<PathBuf>) ->
+        impl Generator<Yield = iold::YieldValue, Return = io::Result<()>> + 'a
+    {
+        static move || {
+            if self.data_stream.is_some() {
+                let x = Default::default();
+                let path = match *path {
+                    Some(ref p) => p,
+                    None => &x,
+                };
+                let directory = PathBuf::from(&path);
+                let res = self.complete_path(directory);
+                if let Ok(path) = res {
+                    await!(self.send(ResultCode::DataConnectionAlreadyOpen, "Starting to list directory..."))?;
+                    let mut out = vec![];
+                    if path.is_dir() {
+                        if let Ok(dir) = read_dir(path) {
+                            for entry in dir {
+                                if let Ok(entry) = entry {
+                                    if self.is_admin ||
+                                        entry.path() != self.server_root.join(CONFIG_FILE) {
+                                            add_file_info(entry.path(), &mut out);
+                                        }
                                 }
                             }
+                        } else {
+                            await!(self.send(ResultCode::InvalidParameterOrArgument, "No such file or directory"))?;
+                            return Ok(());
                         }
-                    } else {
-                        self.send(ResultCode::InvalidParameterOrArgument, "No such file or directory")?;
-                        return Ok(());
+                    } else if self.is_admin || path != self.server_root.join(CONFIG_FILE) {
+                        add_file_info(path, &mut out);
                     }
-                } else if self.is_admin || path != self.server_root.join(CONFIG_FILE) {
-                    add_file_info(path, &mut out);
+                    await!(self.send_data(out))?;
+                    println!("-> and done!");
+                } else {
+                    await!(self.send(ResultCode::InvalidParameterOrArgument, "No such file or directory"))?;
                 }
-                self.send_data(out)?;
-                println!("-> and done!");
             } else {
-                self.send(ResultCode::InvalidParameterOrArgument, "No such file or directory")?;
+                await!(self.send(ResultCode::ConnectionClosed, "No opened data connection"))?;
             }
-        } else {
-            self.send(ResultCode::ConnectionClosed, "No opened data connection")?;
+            if self.data_stream.is_some() {
+                self.close_data_connection();
+                await!(self.send(ResultCode::ClosingDataConnection, "Transfer done"))?;
+            }
+            Ok(())
         }
-        if self.data_stream.is_some() {
-            self.close_data_connection();
-            self.send(ResultCode::ClosingDataConnection, "Transfer done")?;
-        }
-        Ok(())
     }
 
     fn close_data_connection(&mut self) {
         self.data_stream = None;
     }
 
+    async! {
     fn pasv(&mut self) -> io::Result<()> {
         let port =
             if let Some(port) = self.data_port {
@@ -277,24 +298,26 @@ impl Client {
                 0
             };
         if self.data_stream.is_some() {
-            return self.send(ResultCode::DataConnectionAlreadyOpen, "Already listening...");
+            return await!(self.send(ResultCode::DataConnectionAlreadyOpen, "Already listening..."));
         }
 
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), port);
         let listener = TcpListener::bind(&addr)?;
         let port = listener.local_addr()?.port();
 
-        self.send(ResultCode::EnteringPassiveMode, &format!("127,0,0,1,{},{}", port >> 8, port & 0xFF))?;
+        let answer = format!("127,0,0,1,{},{}", port >> 8, port & 0xFF);
+        await!(self.send(ResultCode::EnteringPassiveMode, &answer))?;
 
         println!("Waiting clients on port {}...", port);
-        match listener.incoming().next() {
-            Some(stream) => self.data_stream = Some(stream?),
-            None => unreachable!(),
-        }
+        let (stream, _addr) = await!(listener.accept_async())?;
+        println!("Accepted client");
+        self.data_stream = Some(stream);
 
         Ok(())
     }
+    }
 
+    async! {
     fn cwd(&mut self, directory: &PathBuf) -> io::Result<()> {
         let path = self.cwd.join(&directory);
         let res = self.complete_path(path);
@@ -303,11 +326,12 @@ impl Client {
             if let Ok(prefix) = res {
                 self.cwd = prefix.to_path_buf();
                 prefix_slash(&mut self.cwd);
-                return self.send(ResultCode::RequestedFileActionOkay, &format!("Directory changed to \"{}\"",
-                                                             directory.display()));
+                let answer = format!("Directory changed to \"{}\"", directory.display());
+                return await!(self.send(ResultCode::RequestedFileActionOkay, &answer));
             }
         }
-        self.send(ResultCode::FileNotFound, "No such file or directory")
+        await!(self.send(ResultCode::FileNotFound, "No such file or directory"))
+    }
     }
 
     fn complete_path(&self, path: PathBuf) -> io::Result<PathBuf> {
@@ -325,6 +349,7 @@ impl Client {
         dir
     }
 
+    async! {
     fn mkd(&mut self, path: &PathBuf) -> io::Result<()> {
         let path = self.cwd.join(&path);
         let parent = get_parent(path.clone());
@@ -335,108 +360,130 @@ impl Client {
                     if let Some(filename) = get_filename(path) {
                         dir.push(filename);
                         if create_dir(dir).is_ok() {
-                            return self.send(ResultCode::PATHNAMECreated,
-                                             "Folder successfully created!");
+                            return await!(self.send(ResultCode::PATHNAMECreated,
+                                             "Folder successfully created!"));
                         }
                     }
                 }
             }
         }
-        self.send(ResultCode::FileNotFound, "Couldn't create folder")
+        await!(self.send(ResultCode::FileNotFound, "Couldn't create folder"))
+    }
     }
 
+    async! {
     fn rmd(&mut self, directory: &PathBuf) -> io::Result<()> {
         let path = self.cwd.join(&directory);
         if let Ok(dir) = self.complete_path(path) {
             if remove_dir_all(dir).is_ok() {
-                return self.send(ResultCode::RequestedFileActionOkay,
-                                 "Folder successfully removed");
+                return await!(self.send(ResultCode::RequestedFileActionOkay, "Folder successfully removed"));
             }
         }
-        self.send(ResultCode::FileNotFound, "Couldn't remove folder")
+        await!(self.send(ResultCode::FileNotFound, "Couldn't remove folder"))
+    }
     }
 
     fn strip_prefix(&self, dir: PathBuf) -> result::Result<PathBuf, StripPrefixError> {
         dir.strip_prefix(&self.server_root).map(|p| p.to_path_buf())
     }
 
-    fn send(&mut self, result: ResultCode, msg: &str) -> io::Result<()> {
+    fn send<'a>(&'a mut self, result: ResultCode, msg: &'a str) ->
+        impl Generator<Yield = iold::YieldValue, Return = io::Result<()>> + 'a
+    {
         send_cmd(&mut self.stream, result, msg)
     }
 
-    fn send_data(&mut self, data: Vec<u8>) -> io::Result<()> {
-        if let Some(ref mut stream) = self.data_stream {
-            stream.write_all(&data)?;
+    fn send_data<'a>(&'a mut self, data: Vec<u8>) -> impl Generator<Yield = iold::YieldValue, Return = io::Result<()>>
+        + 'a
+    {
+        static move || {
+            println!("Trying to send data");
+            if let Some(ref mut stream) = self.data_stream {
+                println!("Sending data");
+                await!(stream.write_async(&data))?; // TODO: ensure that wrote all data.
+                println!("Data sent");
+            }
+            Ok(())
         }
-        Ok(())
     }
 
+    async! {
     fn run(&mut self) -> io::Result<()> {
         while !self.has_quit {
-            let data = read_all_message(&mut self.stream);
+            let data = await!(read_all_message(&mut self.stream));
             if data.is_empty() {
                 println!("client disconnected...");
                 break;
             }
             if let Ok(command) = Command::new(data) {
-                self.handle_cmd(command)?;
+                await!(self.handle_cmd(command))?;
             } else {
                 println!("Error with client command...");
             }
         }
         Ok(())
     }
+    }
 
+    async! {
     fn quit(&mut self) -> io::Result<()> {
         // TODO
         if self.data_stream.is_some() {
             unimplemented!();
         } else {
-            self.send(ResultCode::ServiceClosingControlConnection, "Closing connection...")?;
+            await!(self.send(ResultCode::ServiceClosingControlConnection, "Closing connection..."))?;
             self.has_quit = true;
         }
         Ok(())
     }
+    }
 
+    async! {
     fn retr(&mut self, path: &PathBuf) -> io::Result<()> {
         // TODO: check if multiple data connection can be opened at the same time.
         if self.data_stream.is_some() {
             let path = self.cwd.join(path);
             if let Ok(path) = self.complete_path(path.clone()) { // TODO: still ugly clone
                 if path.is_file() && (self.is_admin || path != self.server_root.join(CONFIG_FILE)) {
-                    self.send(ResultCode::DataConnectionAlreadyOpen, "Starting to send file...")?;
+                    await!(self.send(ResultCode::DataConnectionAlreadyOpen, "Starting to send file..."))?;
                     let mut file = File::open(path)?;
                     let mut out = vec![];
                     // TODO: send the file chunck by chunck if it is big (if needed).
                     file.read_to_end(&mut out)?;
-                    self.send_data(out)?;
+                    await!(self.send_data(out))?;
                     println!("-> file transfer done!");
                 } else {
                     match path.to_str().ok_or_else(|| Error::Msg("No path".to_string())) {
-                        Ok(p) => self.send(ResultCode::LocalErrorInProcessing,
-                                           &format!("\"{}\" doesn't exist", p)),
-                        Err(_) => self.send(ResultCode::LocalErrorInProcessing,
-                                            "path doesn't exist"),
+                        Ok(p) => {
+                            let answer = format!("\"{}\" doesn't exist", p);
+                            await!(self.send(ResultCode::LocalErrorInProcessing, &answer))
+                        },
+                        Err(_) => await!(self.send(ResultCode::LocalErrorInProcessing,
+                                            "path doesn't exist")),
                     }?;
                 }
             } else {
                 match path.to_str().ok_or_else(|| Error::Msg("No path".to_string())) {
-                    Ok(p) => self.send(ResultCode::LocalErrorInProcessing,
-                                       &format!("\"{}\" doesn't exist", p)),
-                    Err(_) => self.send(ResultCode::LocalErrorInProcessing,
-                                        "path doesn't exist"),
+                    Ok(p) => {
+                        let answer = format!("\"{}\" doesn't exist", p);
+                        await!(self.send(ResultCode::LocalErrorInProcessing, &answer))
+                    },
+                    Err(_) => await!(self.send(ResultCode::LocalErrorInProcessing,
+                                        "path doesn't exist")),
                 }?;
             }
         } else {
-            self.send(ResultCode::ConnectionClosed, "No opened data connection")?;
+            await!(self.send(ResultCode::ConnectionClosed, "No opened data connection"))?;
         }
         if self.data_stream.is_some() {
             self.close_data_connection();
-            self.send(ResultCode::ClosingDataConnection, "Transfer done")?;
+            await!(self.send(ResultCode::ClosingDataConnection, "Transfer done"))?;
         }
         Ok(())
     }
+    }
 
+    async! {
     fn stor(&mut self, path: &PathBuf) -> io::Result<()> {
         if self.data_stream.is_some() {
             if invalid_path(path) ||
@@ -444,98 +491,122 @@ impl Client {
                 return Err(io::ErrorKind::PermissionDenied.into());
             }
             let path = self.cwd.join(path);
-            self.send(ResultCode::DataConnectionAlreadyOpen, "Starting to send file...")?;
-            let data = self.receive_data()?;
+            await!(self.send(ResultCode::DataConnectionAlreadyOpen, "Starting to send file..."))?;
+            let data = await!(self.receive_data())?;
             let mut file = File::create(path)?;
             file.write_all(&data)?;
             println!("-> file transfer done!");
             self.close_data_connection();
-            self.send(ResultCode::ClosingDataConnection, "Transfer done")
+            await!(self.send(ResultCode::ClosingDataConnection, "Transfer done"))
         } else {
-            self.send(ResultCode::ConnectionClosed, "No opened data connection")
+            await!(self.send(ResultCode::ConnectionClosed, "No opened data connection"))
         }
     }
+    }
 
+    async! {
     fn receive_data(&mut self) -> io::Result<Vec<u8>> {
+        println!("Receive data");
         // NOTE: have to use this weird trick because of futures-await.
         // TODO: fix that when the lifetime stuff is improved for generators.
         Ok(if let Some(ref mut data_stream) = self.data_stream {
-            let mut file_data = vec![];
-            data_stream.read_to_end(&mut file_data)?;
+            let mut file_data = vec![0; 4096];
+            loop {
+                println!("Reading");
+                await!(data_stream.read_async(&mut file_data)).expect("read async"); // TODO: handle error
+                println!("***** {:?}", file_data);
+            }
             file_data
         } else {
             vec![]
         })
     }
+    }
 }
 
-fn read_all_message(stream: &mut TcpStream) -> Vec<u8> {
-    let buf = &mut [0; 1];
-    let mut out = Vec::with_capacity(100);
+fn read_all_message<'a>(stream: &'a mut TcpStream) -> impl Generator<Yield = iold::YieldValue, Return = Vec<u8>> + 'a {
+    static move || {
+        let buf = &mut [0; 1];
+        let mut out = Vec::with_capacity(100);
 
-    loop {
-        match stream.read(buf) {
-            Ok(received) if received > 0 => {
-                if out.is_empty() && buf[0] == b' ' {
-                    continue
+        loop {
+            match await!(stream.read_async(buf)) {
+                Ok(received) if received > 0 => {
+                    if out.is_empty() && buf[0] == b' ' {
+                        continue
+                    }
+                    out.push(buf[0]);
                 }
-                out.push(buf[0]);
+                _ => return Vec::new(),
             }
-            _ => return Vec::new(),
-        }
-        let len = out.len();
-        if len > 1 && out[len - 2] == b'\r' && out[len - 1] == b'\n' {
-            out.pop();
-            out.pop();
-            return out;
+            let len = out.len();
+            if len > 1 && out[len - 2] == b'\r' && out[len - 1] == b'\n' {
+                out.pop();
+                out.pop();
+                return out;
+            }
         }
     }
 }
 
-fn send_cmd(stream: &mut TcpStream, code: ResultCode, message: &str) -> io::Result<()> {
-    let msg = if message.is_empty() {
-        format!("{}\r\n", code as u32)
-    } else {
-        format!("{} {}\r\n", code as u32, message)
-    };
-    println!("<==== {}", msg);
-    write!(stream, "{}", msg)
+fn send_cmd<'a>(stream: &'a mut TcpStream, code: ResultCode, message: &'a str) ->
+    impl Generator<Yield = iold::YieldValue, Return = io::Result<()>> + 'a
+{
+    static move || {
+        let msg = if message.is_empty() {
+            format!("{}\r\n", code as u32)
+        } else {
+            format!("{} {}\r\n", code as u32, message)
+        };
+        println!("<==== {}", msg);
+        await!(stream.write_async(msg.as_bytes()))?;
+        Ok(())
+    }
 }
 
-fn handle_client(mut stream: TcpStream, server_root: PathBuf, config: Config) -> io::Result<()> {
-    println!("new client connected!");
-    send_cmd(&mut stream, ResultCode::ServiceReadyForNewUser, "Welcome to this FTP server!")?;
-    let mut client = Client::new(stream, server_root, config);
-    client.run()
+fn handle_client<'a>(mut stream: TcpStream, server_root: PathBuf, config: Config) ->
+    impl Generator<Yield = iold::YieldValue, Return = io::Result<()>> + 'a
+{
+    static move || {
+        println!("new client connected!");
+        await!(send_cmd(&mut stream, ResultCode::ServiceReadyForNewUser, "Welcome to this FTP server!"))?;
+        let mut client = Client::new(stream, server_root, config);
+        await!(client.run())
+    }
 }
 
+async! {
 fn server() -> io::Result<()> {
     let listener = TcpListener::bind("0.0.0.0:1234")?;
     let server_root = env::current_dir()?;
     let config = Config::new(CONFIG_FILE).expect("Error while loading config...");
 
     println!("Waiting for clients to connect...");
-    for stream in listener.incoming() {
+    loop {
+        let stream = await!(listener.accept_async());
         match stream {
-            Ok(stream) => {
+            Ok((stream, _addr)) => {
                 let server_root = server_root.clone();
                 let config = config.clone();
-                go!(|| {
-                    if let Err(error) = handle_client(stream, server_root, config) {
+                if let Err(error) = spawn! {
+                    if let Err(error) = await!(handle_client(stream, server_root, config)) {
                         println!("Error handling client: {}", error)
                     }
-                });
+                } {
+                    println!("Error spawning: {}", error);
+                }
             }
             _ => {
                 println!("A client tried to connect...")
             }
         }
     }
-    Ok(())
+}
 }
 
 fn main() {
-    if let Err(error) = server() {
+    let mut event_loop = EventLoop::new().expect("event loop");
+    if let Err(error) = event_loop.run(server()) {
         println!("Error running the server: {}", error);
     }
 }

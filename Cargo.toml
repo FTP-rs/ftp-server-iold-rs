@@ -1,8 +1,9 @@
 [package]
-name = "ftp-serveur-may"
+name = "ftp-serveur-iold"
 version = "0.0.1"
+
 [dependencies]
-may = "^0.2.0"
+iold = { git = "https://github.com/antoyo/iold" }
 time = "^0.1.39"
 toml = "0.4"
 serde = "1.0"

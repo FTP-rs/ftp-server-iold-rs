@@ -15,15 +15,6 @@ pub enum Error {
     Utf8(Utf8Error),
 }
 
-impl Error {
-    pub fn to_io_error(self) -> io::Error {
-        match self {
-            Io(error) => error,
-            FromUtf8(_) | Msg(_) | Utf8(_) => io::ErrorKind::Other.into(),
-        }
-    }
-}
-
 impl Display for Error {
     fn fmt(&self, formatter: &mut Formatter) -> fmt::Result {
         match *self {
